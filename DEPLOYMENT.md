@@ -131,8 +131,9 @@ sudo certbot certonly --standalone -d api.yourdomain.com
 *(Certificates are saved to `/etc/letsencrypt/live/api.yourdomain.com/`)*
 
 ### 5. Update Nginx SSL Domain
-Edit `nginx/nginx.prod.conf`:
+First change into your cloned project directory, then edit `nginx/nginx.prod.conf`:
 ```bash
+cd ~/RHEO_   # or cd ~/Rheo
 nano nginx/nginx.prod.conf
 ```
 Replace `DOMAIN_NAME` with your actual domain (e.g. `api.yourdomain.com`).
