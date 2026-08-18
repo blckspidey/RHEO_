@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ─────────────────────────────────────────────────────────────────
 # RHEO — Production Docker Compose (AWS EC2 / Self-Hosted)
 #
@@ -45,6 +43,7 @@ services:
 
   # ── Node.js Backend Server ────────────────────────────────────
   server:
+    image: rheo-server:latest
     build:
       context: ./server
       dockerfile: Dockerfile
