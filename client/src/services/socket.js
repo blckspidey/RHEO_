@@ -1,7 +1,7 @@
 import { io } from 'socket.io-client';
 
 const getSocketUrl = () => {
-  if (import.meta.env.VITE_SOCKET_URL && !import.meta.env.VITE_SOCKET_URL.includes('localhost')) {
+  if (import.meta.env.VITE_SOCKET_URL) {
     return import.meta.env.VITE_SOCKET_URL;
   }
   if (typeof window !== 'undefined') {
@@ -49,7 +49,6 @@ export function initSocket(token) {
   return socket;
 }
 
-
 export function getSocket() {
   if (!socket) {
     const token = currentToken || localStorage.getItem('ds_token');
@@ -67,4 +66,3 @@ export function disconnectSocket() {
     socket = null;
   }
 }
-

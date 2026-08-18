@@ -4,7 +4,7 @@
 import axios from 'axios';
 
 const getApiBase = () => {
-  if (import.meta.env.VITE_API_URL && !import.meta.env.VITE_API_URL.includes('localhost')) {
+  if (import.meta.env.VITE_API_URL) {
     return import.meta.env.VITE_API_URL;
   }
   if (typeof window !== 'undefined') {
@@ -17,7 +17,6 @@ const api = axios.create({
   baseURL: getApiBase(),
   withCredentials: true,
 });
-
 
 // Attach JWT from localStorage on every request
 api.interceptors.request.use((config) => {
