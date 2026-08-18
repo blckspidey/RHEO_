@@ -1,0 +1,106 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────
+# DropShare — Local Development Docker Compose
+#
+# Runs: Node.js app + PostgreSQL + Redis
+# AWS services (ALB, EC2 Auto Scaling) are not required locally.
+# Nginx is included to mirror production routing locally.
+# ─────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: dropshare_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dropshare
+      POSTGRES_USER: dropshare
+      POSTGRES_PASSWORD: dropshare_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Note: Schema is managed by Prisma migrations (server/prisma/).
+      # The postgres container no longer needs to run the raw SQL file.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dropshare -d dropshare"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: dropshare_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Node.js Backend ───────────────────────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: dropshare_server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 5000
+      DATABASE_URL: postgresql://dropshare:dropshare_pass@postgres:5432/dropshare
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: local_dev_jwt_secret_change_in_prod
+      JWT_EXPIRES_IN: 7d
+      CLIENT_URL: http://localhost:5173
+      CHUNK_SIZE_BYTES: 1048576
+      MAX_FILE_SIZE_BYTES: 5368709120
+      MAX_IN_FLIGHT_CHUNKS: 8
+      DB_CHECKPOINT_INTERVAL: 50
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount source for live reload in dev (remove in production)
+      - ./server/src:/app/src:ro
+      # Mount Prisma schema so migrate deploy can run inside the container
+      - ./server/prisma:/app/prisma:ro
+    # Run Prisma migrations before starting the server.
+    # prisma migrate deploy is idempotent — safe to run on every restart.
+    command: sh -c "npx prisma migrate deploy && node src/server.js"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────
+  # Proxies HTTP → server, handles WebSocket upgrade.
+  # In production, ALB takes this role for HTTPS/WSS termination.
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: dropshare_nginx
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  pgdata:
+  redisdata:

@@ -1,0 +1,89 @@
+name: RHEO Production CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - v1
+      - main
+
+jobs:
+  # ── Job 1: Build & Verify ──────────────────────────────────────
+  verify:
+    name: Verify & Build Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install Server Dependencies
+        run: |
+          cd server
+          npm ci
+
+      - name: Generate Prisma Client
+        run: |
+          cd server
+          npx prisma generate
+
+      - name: Install Client Dependencies & Test Build
+        run: |
+          cd client
+          npm ci
+          npm run build
+
+  # ── Job 2: Deploy Backend to AWS EC2 ───────────────────────────
+  deploy-backend:
+    name: Deploy Backend to AWS EC2
+    needs: verify
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/v1' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Remote SSH Commands on AWS EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/Rheo || cd ~/Rheo
+            git fetch origin
+            git checkout v1
+            git pull origin v1
+            docker-compose -f docker-compose.prod.yml down --remove-orphans || true
+            docker-compose -f docker-compose.prod.yml up -d --build
+            docker image prune -f
+
+  # ── Job 3: Deploy Frontend to Vercel ───────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend to Vercel
+    needs: verify
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/v1' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Vercel Production
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+          working-directory: ./client

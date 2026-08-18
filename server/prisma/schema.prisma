@@ -1,0 +1,105 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Model: User
+//
+// Prisma uses camelCase field names; @map() links them to the
+// snake_case column names that PostgreSQL expects.
+// @updatedAt is managed by Prisma automatically — no DB trigger needed.
+// ─────────────────────────────────────────────────────────────────
+model User {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  username     String    @unique @db.VarChar(50)
+  email        String    @unique @db.VarChar(255)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  displayName  String?   @map("display_name") @db.VarChar(100)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  lastSeen     DateTime? @map("last_seen") @db.Timestamptz
+
+  // Relations
+  sentGroups        TransferGroup[]
+  sentTransfers     Transfer[] @relation("SenderRelation")
+  receivedTransfers Transfer[] @relation("ReceiverRelation")
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Model: TransferGroup
+//
+// One group per file-send operation.
+// Shared file metadata; one row per file regardless of recipient count.
+// Example: Ganesh sends movie.mp4 to Rahul + Amit = 1 group, 2 transfers.
+// ─────────────────────────────────────────────────────────────────
+model TransferGroup {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  senderId    String   @map("sender_id") @db.Uuid
+  fileName    String   @map("file_name") @db.VarChar(500)
+  // BigInt supports files up to 9.2 EB — far beyond our 5 GB V1 limit.
+  // Note: BigInt does NOT serialize to JSON natively. Convert with Number()
+  // before returning in API responses (safe up to 9 PB).
+  fileSize    BigInt   @map("file_size")
+  totalChunks Int      @map("total_chunks")
+  // SHA-256 hex digest (64 chars) — pre-computed by sender's browser
+  fileHash    String?  @map("file_hash") @db.VarChar(64)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  sender    User       @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  transfers Transfer[]
+
+  @@index([senderId])
+  @@map("transfer_groups")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Model: Transfer
+//
+// One row per (TransferGroup × recipient).
+// Each transfer has its own status and lastConfirmedChunk.
+// lastConfirmedChunk: persisted checkpoint for resume-after-disconnect.
+// Starts at -1 (no chunks confirmed yet).
+//
+// Status values (mirrors TRANSFER_STATUS in constants/index.js):
+//   PENDING → ACCEPTED → TRANSFERRING → COMPLETED
+//                                     → PAUSED
+//                                     → INTERRUPTED
+//                                     → FAILED
+//                                     → CANCELLED
+//                      → REJECTED
+// ─────────────────────────────────────────────────────────────────
+model Transfer {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  groupId            String    @map("group_id") @db.Uuid
+  senderId           String    @map("sender_id") @db.Uuid
+  receiverId         String    @map("receiver_id") @db.Uuid
+  status             String    @default("PENDING") @db.VarChar(20)
+  // -1 = no chunks confirmed yet
+  lastConfirmedChunk Int       @default(-1) @map("last_confirmed_chunk")
+  totalChunks        Int       @map("total_chunks")
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  completedAt        DateTime? @map("completed_at") @db.Timestamptz
+
+  // Relations
+  group    TransferGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  sender   User          @relation("SenderRelation",   fields: [senderId],   references: [id], onDelete: Cascade)
+  receiver User          @relation("ReceiverRelation", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([status])
+  @@index([groupId])
+  @@map("transfers")
+}
