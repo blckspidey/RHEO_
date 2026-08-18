@@ -4,7 +4,7 @@
 
 ---
 
-## Table of Contents..
+## Table of Contents...
 
 1. [What This Is](#what-this-is)
 2. [Architecture Overview](#architecture-overview)
