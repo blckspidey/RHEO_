@@ -94,16 +94,27 @@ jobs:
 
       - name: Execute Remote SSH Commands on AWS EC2
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DATABASE_URL,JWT_SECRET
           script: |
             set -e
             cd /home/ubuntu/Rheo || cd ~/Rheo || cd ~/RHEO_
+            sudo mkdir -p /etc/letsencrypt /var/www/certbot || true
             git fetch origin
             git checkout ${{ github.ref_name }}
             git pull origin ${{ github.ref_name }}
+            if [ -n "$DATABASE_URL" ]; then
+              echo "DATABASE_URL=\"$DATABASE_URL\"" > .env
+              echo "REDIS_URL=\"redis://redis:6379\"" >> .env
+              echo "NODE_ENV=\"production\"" >> .env
+              echo "PORT=5000" >> .env
+            fi
             docker-compose -f docker-compose.prod.yml down --remove-orphans || true
             docker-compose -f docker-compose.prod.yml up -d --build
             docker image prune -f
