@@ -42,8 +42,10 @@ export function initSocket(token) {
   socket = io(getSocketUrl(), {
     auth: { token, avatarId: savedAvatar, avatarIndex },
     transports: ['websocket', 'polling'],
-    reconnectionAttempts: 10,
-    reconnectionDelay: 1500,
+    upgrade: true,
+    reconnectionAttempts: 15,
+    reconnectionDelay: 1000,
+    timeout: 10000,
   });
 
   return socket;

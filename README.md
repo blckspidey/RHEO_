@@ -1,711 +1,610 @@
-# DropShare V1 — Real-Time Multi-User File Transfer System
+# RHEO — Real-Time Relay File Transfer
 
-> A clean, relay-based file transfer system built on WebSocket (Socket.IO), Node.js, PostgreSQL, and Redis. Designed to be fully understandable, explainable, and production-ready at V1 scale.
+> A production-ready, relay-based file sharing platform built on **WebSocket (Socket.IO)**, **Node.js**, **PostgreSQL**, and **Redis**. Send files of up to 5 GB to multiple users simultaneously — with rooms, live chat, resumable transfers, and zero peer-to-peer complexity.
 
----
-
-## Table of Contents...
-
-1. [What This Is](#what-this-is)
-2. [Architecture Overview](#architecture-overview)
-3. [Networking Deep-Dive](#networking-deep-dive)
-4. [Directory Structure](#directory-structure)
-5. [Data Flow — Sending a File](#data-flow--sending-a-file)
-6. [Transfer State Machine](#transfer-state-machine)
-7. [Database Schema](#database-schema)
-8. [Redis Usage](#redis-usage)
-9. [Connection Recovery](#connection-recovery)
-10. [Running Locally (Docker)](#running-locally-docker)
-11. [Running Without Docker](#running-without-docker)
-12. [Environment Variables](#environment-variables)
-13. [API Reference](#api-reference)
-14. [Socket.IO Events](#socketio-events)
-15. [Scaling to Multiple Instances](#scaling-to-multiple-instances)
+[![Node.js](https://img.shields.io/badge/Node.js-20-green)](https://nodejs.org)
+[![React](https://img.shields.io/badge/React-18-blue)](https://react.dev)
+[![Socket.IO](https://img.shields.io/badge/Socket.IO-4.x-black)](https://socket.io)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue)](https://postgresql.org)
+[![Redis](https://img.shields.io/badge/Redis-7-red)](https://redis.io)
+[![Prisma](https://img.shields.io/badge/Prisma-ORM-purple)](https://prisma.io)
 
 ---
 
-## What This Is
+## Table of Contents
 
-DropShare is a **server-relay file transfer system**. When Ganesh sends a file to Rahul:
+1. [What is RHEO?](#what-is-rheo)
+2. [Key Features](#key-features)
+3. [Architecture Overview](#architecture-overview)
+4. [How File Transfer Works](#how-file-transfer-works)
+5. [Transfer State Machine](#transfer-state-machine)
+6. [Rooms & Live Chat](#rooms--live-chat)
+7. [Connection Recovery](#connection-recovery)
+8. [Tech Stack](#tech-stack)
+9. [Directory Structure](#directory-structure)
+10. [Database Schema](#database-schema)
+11. [Redis Usage](#redis-usage)
+12. [API Reference](#api-reference)
+13. [Socket.IO Events](#socketio-events)
+14. [Environment Variables](#environment-variables)
+15. [Running Locally](#running-locally)
+16. [Production Deployment](#production-deployment)
+17. [CI/CD Pipeline](#cicd-pipeline)
+
+---
+
+## What is RHEO?
+
+RHEO is a **server-relay file transfer system**. When a sender uploads a file, the server streams it chunk-by-chunk to each receiver in real time:
 
 ```
-Ganesh's Browser  ──WebSocket──►  DropShare Server  ──WebSocket──►  Rahul's Browser
+Sender's Browser  ──WebSocket──►  RHEO Server  ──WebSocket──►  Receiver's Browser
 ```
 
-- **No WebRTC.** No STUN/TURN. No peer-to-peer complexity.
-- **No full-file buffering.** The server relays one chunk at a time (~1 MB each).
-- **Resumable.** If either side disconnects mid-transfer, it picks up from the last confirmed chunk.
-- **Multi-recipient.** One send operation creates independent transfers for each recipient.
+**Key philosophy:**
+- ❌ No WebRTC. No STUN/TURN servers. No NAT traversal headaches.
+- ❌ No full-file buffering on the server. Chunks are relayed one at a time (~1 MB each).
+- ✅ Resumable transfers. If either side disconnects mid-transfer, it picks up from the last confirmed chunk.
+- ✅ Multi-recipient. One send operation fans out to independent transfer streams for every receiver.
+- ✅ Collaborative rooms. Users can create rooms, invite others, chat, and share files together.
 
-> "The objective is not to build Dropbox. The objective is to build a clean, reliable, scalable V1 networking project."
+---
+
+## Key Features
+
+| Feature | Description |
+|---|---|
+| 🚀 **Chunked Relay Transfer** | Files split into 1 MB chunks, relayed in real-time via WebSocket |
+| 📶 **Resumable Transfers** | PostgreSQL checkpoints allow resume after disconnect |
+| 👥 **Multi-Recipient** | One file → independent streams to N receivers simultaneously |
+| 🏠 **Collaborative Rooms** | Create rooms with 6-digit codes, invite friends |
+| 💬 **Live Room Chat** | Real-time in-room chat with optimistic UI rendering |
+| 🔐 **JWT Authentication** | Secure user auth with access + refresh token rotation |
+| 📡 **Presence System** | Live online/offline indicator via Redis TTL keys |
+| 📊 **Transfer Stats** | Live speed, ETA, and progress tracking |
+| 🐳 **Docker Ready** | Full Docker Compose for dev and production |
+| ⚡ **CI/CD Automated** | GitHub Actions deploys backend to EC2 + frontend to Vercel |
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          Client Layer                                │
-│                                                                      │
-│   React (Vite) + socket.io-client + Axios                           │
-│   Auth → Dashboard → DropZone → UserSearch → TransferCards          │
-└───────────────────────┬──────────────────────────────────────────────┘
-                        │  HTTP (REST) + WebSocket (WS upgrade over TCP)
-                        ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                          Nginx / ALB                                 │
-│                                                                      │
-│   Handles WebSocket upgrade headers:                                 │
-│     Upgrade: websocket                                               │
-│     Connection: Upgrade                                              │
-└───────────────────────┬──────────────────────────────────────────────┘
-                        │
-          ┌─────────────┴─────────────┐
-          ▼                           ▼
-┌──────────────────┐       ┌──────────────────┐
-│   Node.js EC2-1  │       │   Node.js EC2-2  │   (horizontal scale)
-│                  │       │                  │
-│  Express (REST)  │       │  Express (REST)  │
-│  Socket.IO       │◄─────►│  Socket.IO       │
-│  TransferManager │  Redis│  TransferManager │
-└────────┬─────────┘  Pub/ └────────┬─────────┘
-         │            Sub           │
-         └──────────────────────────┘
-                        │
-          ┌─────────────┴─────────────┐
-          ▼                           ▼
-┌──────────────────┐       ┌──────────────────┐
-│   PostgreSQL     │       │   Redis           │
-│                  │       │                  │
-│  users           │       │  Presence (TTL)  │
-│  transfer_groups │       │  Pub/Sub channels│
-│  transfers       │       │  (presence,      │
-│  (checkpoints)   │       │   transfer_events│
-└──────────────────┘       └──────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                             │
+│                                                                 │
+│   React (Vite) + Socket.IO Client + Axios                       │
+│   Auth → Dashboard → RadarScanner → Rooms → TransferCards       │
+│   Deployed on: Vercel                                           │
+└────────────────────────┬────────────────────────────────────────┘
+                         │  HTTPS REST + WSS WebSocket
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     NGINX REVERSE PROXY                         │
+│                                                                 │
+│   SSL Termination (Let's Encrypt)                               │
+│   WebSocket Upgrade headers forwarded                           │
+│   Proxy to Node.js on port 5000                                 │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   NODE.JS BACKEND (AWS EC2)                     │
+│                                                                 │
+│   Express.js     — REST API (Auth, Users, Transfers)            │
+│   Socket.IO      — Real-time events, chunk relay                │
+│   TransferManager — In-flight chunk flow control (8 in-flight)  │
+│   ChunkHandler   — Receives chunks, relays to receiver          │
+│   RoomHandler    — Room state, invitations, live chat           │
+│   PresenceHandler — Online/offline tracking via Redis           │
+└────────────┬────────────────────────┬───────────────────────────┘
+             │                        │
+             ▼                        ▼
+┌──────────────────────┐   ┌──────────────────────┐
+│     PostgreSQL       │   │        Redis          │
+│    (Neon DB / EC2)   │   │     (EC2 Docker)      │
+│                      │   │                       │
+│  users               │   │  Presence TTL keys    │
+│  transfers           │   │  Socket.IO Pub/Sub    │
+│  transfer_chunks     │   │  User → socketId map  │
+│  refresh_tokens      │   │                       │
+└──────────────────────┘   └──────────────────────┘
 ```
 
 ---
 
-## Networking Deep-Dive
+## How File Transfer Works
 
-### TCP → WebSocket → Socket.IO → Application
+### Step-by-Step Flow
 
-Every file chunk travels through these layers:
+1. **Sender selects a file** and a target user on the dashboard.
+2. **Frontend emits `TRANSFER_REQUEST`** via Socket.IO to the server.
+3. **Server creates a `Transfer` record** in PostgreSQL with status `PENDING`.
+4. **Server emits `TRANSFER_REQUEST`** to the receiver's socket.
+5. **Receiver accepts** → emits `TRANSFER_ACCEPTED`.
+6. **Sender starts chunking** the file in the browser using the `FileReader` API (~1 MB per chunk).
+7. **Sender emits `CHUNK_SEND`** for each chunk with `{ transferId, chunkIndex, data (ArrayBuffer) }`.
+8. **Server relays the chunk** instantly to the receiver's socket via `CHUNK_RECEIVE`.
+9. **Receiver emits `CHUNK_ACK`** after processing each chunk.
+10. **Server records checkpoint** in PostgreSQL every 50 chunks.
+11. **Flow control window**: At most 8 unacknowledged chunks in-flight at once — prevents buffer overflow.
+12. **Transfer completes** → status updated to `COMPLETED` in the database.
 
-```
-Application Layer   │  CHUNK event { transferId, chunkIndex, ArrayBuffer }
-─────────────────── │  ──────────────────────────────────────────────────
-Socket.IO           │  Frames the message, handles reconnection
-WebSocket           │  Bidirectional, full-duplex messages over TCP
-TCP                 │  Reliable delivery, ordering, retransmission,
-                    │  congestion control, flow control
-IP / Ethernet       │  Packet routing
-```
-
-**Why WebSocket and not plain HTTP?**
-
-| HTTP (polling)             | WebSocket                              |
-|----------------------------|----------------------------------------|
-| New TCP connection per req | One persistent TCP connection          |
-| Client initiates every req | Server can push at any time            |
-| High overhead for chunks   | Near-zero overhead per chunk           |
-| Not suitable for streaming | Designed for real-time bidirectional   |
-
-### WebSocket Handshake
+### In-Flight Flow Control
 
 ```
-Client → Server:
-  GET /socket.io/?transport=websocket HTTP/1.1
-  Upgrade: websocket
-  Connection: Upgrade
-  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-
-Server → Client:
-  HTTP/1.1 101 Switching Protocols
-  Upgrade: websocket
-  Connection: Upgrade
-  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
-```
-
-After this, the connection **upgrades from HTTP to WebSocket** — a persistent, full-duplex TCP channel. File chunks flow over this channel with no further HTTP overhead.
-
-### TCP vs Application-Level ACKs
-
-A common misconception: "TCP already does reliable delivery, why do we ACK chunks ourselves?"
-
-| Layer | What it guarantees |
-|---|---|
-| **TCP ACK** | "The TCP stack on the receiver got these bytes" |
-| **Application ACK (ours)** | "The receiver app processed this chunk and wrote it to memory" |
-
-TCP can deliver bytes to the socket buffer, but:
-- The browser tab could crash before processing them
-- The WebSocket could disconnect after TCP delivery but before app processing
-- We need to know **which chunk to resume from** after a reconnection
-
-Our `CHUNK_ACK` events are application-level confirmations, enabling precise resume.
-
-### Backpressure
-
-The sender does NOT flood the socket. We limit `MAX_IN_FLIGHT_CHUNKS = 4` (configurable). At any moment, the sender has at most 4 chunks pending acknowledgement:
-
-```
-Sender:  [sent ch0] [sent ch1] [sent ch2] [sent ch3] ← pauses here
-Receiver: ACK ch0 → Sender sends ch4
-Receiver: ACK ch1 → Sender sends ch5
+Sender ──► [Chunk 1] ──► Server ──► Receiver ──► [ACK 1] ──► Sender
+Sender ──► [Chunk 2] ──► Server ──► Receiver ──► [ACK 2] ──► Sender
 ...
+(Max 8 unACKed chunks at once — pauses sender if window is full)
 ```
 
-This prevents memory exhaustion when the receiver is slower than the sender (e.g., slow disk writes on the receiver side).
-
----
-
-## Directory Structure
-
-```
-File_Sharing/
-├── docker-compose.yml          # PostgreSQL + Redis + Server + Nginx (local)
-├── .env.example                # All environment variable templates
-├── nginx/
-│   └── nginx.conf              # WebSocket proxy config
-├── database/
-│   └── migrations/
-│       └── 001_initial.sql     # Full schema (users, transfer_groups, transfers)
-│
-├── server/                     # Node.js backend
-│   ├── Dockerfile              # Multi-stage, non-root
-│   ├── package.json
-│   └── src/
-│       ├── server.js           # HTTP server entry, graceful shutdown
-│       ├── app.js              # Express config, routes, middleware
-│       ├── constants/
-│       │   └── index.js        # All magic strings (TRANSFER_STATUS, SOCKET_EVENTS, ...)
-│       ├── config/
-│       │   ├── env.js          # Single source of truth for process.env
-│       │   ├── db.js           # PostgreSQL pool (pg)
-│       │   └── redis.js        # Redis clients (publisher, subscriber, client)
-│       ├── utils/
-│       │   └── logger.js       # Structured JSON logger
-│       ├── middleware/
-│       │   ├── auth.js         # JWT verification middleware
-│       │   ├── errorHandler.js # Centralized error + 404 handling
-│       │   └── validation.js   # Input sanitization
-│       ├── services/
-│       │   ├── authService.js  # bcrypt + JWT business logic
-│       │   ├── userService.js  # Search, profile, last_seen
-│       │   └── transferService.js # Transfer DB operations + checkpointing
-│       ├── controllers/
-│       │   ├── authController.js
-│       │   └── userController.js
-│       ├── routes/
-│       │   ├── auth.js         # POST /api/auth/register, /login, /refresh
-│       │   ├── users.js        # GET /api/users/search, /:id/status
-│       │   └── transfers.js    # GET /api/transfers, /:id
-│       ├── redis/
-│       │   ├── presence.js     # setUserOnline/Offline, getBulkPresence (Redis TTL)
-│       │   └── pubsub.js       # publish/subscribe helpers for cross-instance events
-│       ├── sockets/
-│       │   ├── index.js        # Socket.IO init, JWT middleware, Redis event routing
-│       │   ├── presenceHandler.js  # GET_PRESENCE socket event
-│       │   ├── transferHandler.js  # TRANSFER_REQUEST/ACCEPT/REJECT/CANCEL
-│       │   ├── chunkHandler.js     # CHUNK/CHUNK_ACK/PAUSE/RESUME + disconnect
-│       │   └── recoveryHandler.js  # TRANSFER_RESUME_REQUEST (reconnect recovery)
-│       └── transfer/
-│           ├── TransferState.js    # In-memory state for one active transfer
-│           └── TransferManager.js  # Singleton registry of all active transfers
-│
-└── client/                     # React frontend (Vite)
-    ├── index.html
-    ├── vite.config.js
-    ├── postcss.config.js
-    ├── tailwind.config.js
-    ├── .env                    # VITE_API_URL, VITE_SOCKET_URL
-    └── src/
-        ├── main.jsx
-        ├── App.jsx             # BrowserRouter + AuthProvider + ProtectedRoute
-        ├── index.css           # Tailwind v4 @theme tokens + utility classes
-        ├── services/
-        │   ├── api.js          # Axios with JWT interceptors
-        │   └── socket.js       # Socket.IO singleton (initSocket / getSocket)
-        ├── utils/
-        │   └── fileUtils.js    # readChunk, computeFileHash (Web Crypto), formatters
-        ├── contexts/
-        │   ├── AuthContext.jsx      # Login, logout, token persistence
-        │   ├── TransferContext.jsx  # Full send/receive state + socket events
-        │   └── PresenceContext.jsx  # USER_ONLINE/OFFLINE real-time presence
-        ├── pages/
-        │   ├── AuthPage.jsx    # Login + Register tabs
-        │   └── Dashboard.jsx   # Send panel + active transfers + history
-        └── components/
-            ├── DropZone.jsx        # Drag-and-drop file selector
-            ├── UserSearch.jsx      # Live user search with online badges
-            ├── TransferCard.jsx    # Progress bar, speed, ETA, actions
-            └── IncomingRequests.jsx # Accept/Decline modal
-```
-
----
-
-## Data Flow — Sending a File
-
-### Step 1: User selects file and recipients
-
-```
-Ganesh picks "movie.mp4" (2 GB) and selects Rahul and Amit.
-Client computes:  totalChunks = ceil(2GB / 1MB) = 2048
-Client computes:  SHA-256 hash (Web Crypto API, async)
-```
-
-### Step 2: TRANSFER_REQUEST
-
-```
-Ganesh's client  ──TRANSFER_REQUEST──►  Server
-  { fileName, fileSize, totalChunks, fileHash, receiverIds: [rahul, amit] }
-
-Server:
-  1. Creates 1 transfer_group row in PostgreSQL
-  2. Creates 2 transfer rows (T001 for Rahul, T002 for Amit)
-  3. Routes TRANSFER_REQUEST event to Rahul (and Amit)
-```
-
-### Step 3: Receiver Accepts
-
-```
-Rahul's client  ──TRANSFER_ACCEPT──►  Server
-  { transferId: 'T001' }
-
-Server:
-  1. Updates T001 status → ACCEPTED in PostgreSQL
-  2. Creates TransferState in TransferManager (in-memory)
-  3. Emits TRANSFER_START to Ganesh's socket
-```
-
-### Step 4: Chunk Transfer Loop
-
-```
-Ganesh's client (sender loop, MAX_IN_FLIGHT = 4):
-  read chunk 0 from File API  → emit CHUNK { idx: 0, data: ArrayBuffer }
-  read chunk 1                → emit CHUNK { idx: 1, data: ArrayBuffer }
-  read chunk 2                → emit CHUNK { idx: 2, data: ArrayBuffer }
-  read chunk 3                → emit CHUNK { idx: 3, data: ArrayBuffer }
-  ← WAITS (4 in flight) ─────────────────────────────────────────────
-
-Server receives CHUNK (idx: 0):
-  state.markSent(0, chunkBytes)
-  → finds Rahul's socket
-  → emit CHUNK to Rahul (immediate relay, no full-file buffer)
-
-Rahul's client receives CHUNK (idx: 0):
-  stores chunk in receiverState.chunks[0]
-  emit CHUNK_ACK { transferId, chunkIndex: 0 }
-
-Server receives CHUNK_ACK (idx: 0):
-  state.acknowledgeChunk(0, checkpointInterval)
-  → if chunksSinceLastCheckpoint >= 50: UPDATE transfers SET last_confirmed_chunk = 0
-  → forwards CHUNK_ACK to Ganesh's socket
-
-Ganesh's client receives CHUNK_ACK (idx: 0):
-  inFlight-- (now 3)
-  → reads chunk 4, emits CHUNK { idx: 4 }
-  ... loop continues
-```
-
-### Step 5: Completion + Hash Verification
-
-```
-Server detects all chunks ACK'd:
-  → emit HASH_VERIFY to Rahul { expectedHash: 'abc123...' }
-  → emit TRANSFER_COMPLETE to Ganesh
-
-Rahul's client:
-  Blob.arrayBuffer() → crypto.subtle.digest('SHA-256') → hex string
-  emit HASH_RESULT { transferId, receiverHash, verified: true/false }
-
-Server relays HASH_RESULT to Ganesh.
-
-If verified:
-  Browser triggers download of the reassembled Blob.
-  Status → COMPLETED in PostgreSQL.
-
-If NOT verified:
-  Status → FAILED. User sees "Hash mismatch — file corrupted".
-```
+This is NOT TCP's congestion window. TCP handles byte-level flow control internally. This application-level window prevents RAM exhaustion when the receiver is slower than the sender.
 
 ---
 
 ## Transfer State Machine
 
 ```
-                    ┌──────────┐
-                    │ PENDING  │  (created, waiting for receiver)
-                    └────┬─────┘
-                         │ TRANSFER_ACCEPT
-                    ┌────▼─────┐
-                    │ ACCEPTED │  (accepted, waiting for sender to start)
-                    └────┬─────┘
-                         │ TRANSFER_START + chunks begin
-                    ┌────▼──────────┐
-              ┌────►│ TRANSFERRING  │◄────┐
-              │     └────┬──────────┘     │
-              │          │ PAUSE          │ RESUME
-              │     ┌────▼─────┐         │
-              │     │  PAUSED  ├─────────►┘
-              │     └──────────┘
-              │
-              │  disconnect
-              │     ┌─────────────┐
-              └─────┤ INTERRUPTED │  (reconnect → TRANSFER_RESUME_REQUEST → TRANSFERRING)
-                    └─────────────┘
-                         │ unrecoverable
-              ┌──────────▼──────────────────────┐
-              │  COMPLETED │ CANCELLED │ FAILED  │
-              │  REJECTED                        │
-              └─────────────────────────────────-┘
+PENDING
+   │
+   │ (receiver accepts)
+   ▼
+TRANSFERRING
+   │
+   ├──────────────────────► COMPLETED
+   │                              │
+   │ (cancel/disconnect)          └─► (final state)
+   ▼
+CANCELLED / FAILED
+```
+
+Each transfer goes through these states stored in PostgreSQL. On reconnection, the server queries the last confirmed chunk index and resumes from there.
+
+---
+
+## Rooms & Live Chat
+
+RHEO includes a full collaborative rooms system built entirely in-memory (no database persistence for rooms):
+
+- **Create a Room** — Generates a unique 6-digit alphanumeric code (e.g. `8X3A92`)
+- **Invite Members** — Search users by username and invite them to your room
+- **Join by Code** — Any user can join a room by entering the 6-digit code
+- **Live Chat** — Real-time text chat with zero-latency optimistic UI rendering
+- **File Announcements** — Automatic notifications when files are shared within a room
+- **Radar View** — Visual scanner showing all online room members with avatars
+
+### Chat Optimistic Rendering
+
+When you send a message, it appears **instantly** in your chat window (0ms delay) without waiting for the server echo. When the server broadcasts the message back, the optimistic placeholder is seamlessly replaced with the confirmed server message.
+
+---
+
+## Connection Recovery
+
+If either the sender or receiver disconnects mid-transfer:
+
+1. **Socket.IO's reconnection** kicks in automatically (up to 15 attempts).
+2. **Server detects reconnect** via `RECOVERY_REQUEST` event.
+3. **Server queries PostgreSQL** for the last confirmed chunk checkpoint.
+4. **Transfer resumes** from the last saved chunk index — no data retransmitted.
+
+This is made possible by PostgreSQL checkpoint writes every 50 chunks via `DB_CHECKPOINT_INTERVAL`.
+
+---
+
+## Tech Stack
+
+### Backend
+| Technology | Purpose |
+|---|---|
+| **Node.js 20** | Server runtime |
+| **Express.js** | REST API framework |
+| **Socket.IO 4** | WebSocket bidirectional events |
+| **Prisma ORM** | Type-safe PostgreSQL access |
+| **PostgreSQL 16** | Persistent storage (users, transfers) |
+| **Redis 7** | Presence TTL, Socket.IO multi-instance pub/sub |
+| **JSON Web Tokens** | Stateless authentication |
+| **bcrypt** | Password hashing |
+
+### Frontend
+| Technology | Purpose |
+|---|---|
+| **React 18** | UI framework |
+| **Vite** | Build tool and dev server |
+| **Socket.IO Client** | Real-time WebSocket connection |
+| **Axios** | HTTP API calls |
+| **Context API** | State management (Auth, Transfer, Room) |
+
+### Infrastructure
+| Technology | Purpose |
+|---|---|
+| **Docker & Docker Compose** | Container orchestration |
+| **Nginx** | SSL termination + reverse proxy |
+| **AWS EC2** | Backend hosting |
+| **Vercel** | Frontend hosting |
+| **Neon DB** | Managed cloud PostgreSQL |
+| **GitHub Actions** | CI/CD pipeline |
+| **Let's Encrypt** | Free SSL certificates |
+
+---
+
+## Directory Structure
+
+```
+rheo/
+├── .github/
+│   └── workflows/
+│       └── deploy.yml          # CI/CD GitHub Actions pipeline
+│
+├── client/                     # React + Vite frontend
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── Avatar.jsx          # User avatar with 16 animal options
+│   │   │   ├── CreateRoomModal.jsx # Room creation flow
+│   │   │   ├── DropZone.jsx        # Drag-and-drop file input
+│   │   │   ├── IncomingRequests.jsx# Incoming transfer accept/reject UI
+│   │   │   ├── Navbar.jsx          # Top navigation bar
+│   │   │   ├── ProfileModal.jsx    # Profile edit, avatar, username
+│   │   │   ├── RadarScanner.jsx    # Visual room member scanner
+│   │   │   ├── ReceiverMode.jsx    # Receiver dashboard panel
+│   │   │   ├── RoomChatBox.jsx     # Floating real-time chat widget
+│   │   │   ├── RoomPanel.jsx       # Full room management panel
+│   │   │   ├── SenderMode.jsx      # Sender dashboard panel
+│   │   │   ├── TransferCard.jsx    # Per-transfer progress card
+│   │   │   ├── TransferStats.jsx   # Global transfer statistics
+│   │   │   └── UserSearch.jsx      # Search users to send files to
+│   │   ├── contexts/
+│   │   │   ├── AuthContext.jsx     # Login, register, JWT management
+│   │   │   ├── RoomContext.jsx     # Room state, chat, invitations
+│   │   │   └── TransferContext.jsx # Transfer lifecycle, speed, ETA
+│   │   ├── pages/
+│   │   │   ├── Dashboard.jsx       # Main app dashboard
+│   │   │   └── Auth.jsx            # Login / Register page
+│   │   └── services/
+│   │       ├── api.js              # Axios HTTP client
+│   │       └── socket.js           # Socket.IO client + reconnection
+│   ├── vercel.json                 # Vercel SPA rewrite config
+│   └── vite.config.js
+│
+├── server/                     # Node.js backend
+│   ├── src/
+│   │   ├── config/
+│   │   │   └── env.js              # Single source of truth for env vars
+│   │   ├── controllers/
+│   │   │   ├── authController.js   # Login, register, refresh token
+│   │   │   ├── transferController.js # Transfer history REST API
+│   │   │   └── userController.js   # User search, profile
+│   │   ├── middleware/
+│   │   │   └── auth.js             # JWT verification middleware
+│   │   ├── redis/
+│   │   │   ├── client.js           # Redis connection singleton
+│   │   │   ├── presence.js         # Online/offline TTL management
+│   │   │   └── pubsub.js           # Multi-instance pub/sub channels
+│   │   ├── routes/
+│   │   │   ├── auth.js             # POST /api/auth/...
+│   │   │   ├── transfers.js        # GET /api/transfers/...
+│   │   │   └── users.js            # GET /api/users/...
+│   │   ├── services/
+│   │   │   ├── authService.js      # JWT sign/verify, bcrypt logic
+│   │   │   ├── transferService.js  # DB operations for transfers
+│   │   │   └── userService.js      # User lookup, update
+│   │   ├── sockets/
+│   │   │   ├── index.js            # Socket.IO server init + auth middleware
+│   │   │   ├── chunkHandler.js     # CHUNK_SEND relay + ACK forwarding
+│   │   │   ├── presenceHandler.js  # Online/offline socket events
+│   │   │   ├── recoveryHandler.js  # Reconnect resume logic
+│   │   │   ├── roomHandler.js      # Room CRUD, invitations, chat
+│   │   │   └── transferHandler.js  # TRANSFER_REQUEST, ACCEPT, CANCEL
+│   │   ├── transfer/
+│   │   │   └── TransferManager.js  # In-flight window + flow control
+│   │   ├── utils/
+│   │   │   └── logger.js           # Structured JSON logger
+│   │   ├── app.js                  # Express app setup
+│   │   └── server.js               # HTTP server entry point
+│   ├── prisma/
+│   │   └── schema.prisma           # Database schema
+│   ├── Dockerfile                  # Multi-stage production Docker build
+│   └── .env.example
+│
+├── nginx/
+│   ├── nginx.conf                  # Development Nginx config
+│   └── nginx.prod.conf             # Production Nginx with SSL
+│
+├── docker-compose.yml              # Development stack
+├── docker-compose.prod.yml         # Production stack (EC2 + Neon DB)
+└── DEPLOYMENT.md                   # Step-by-step deployment guide
 ```
 
 ---
 
 ## Database Schema
 
-```sql
--- One group per file send operation (shared metadata for multi-recipient sends)
-CREATE TABLE transfer_groups (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  sender_id    UUID NOT NULL REFERENCES users(id),
-  file_name    TEXT NOT NULL,
-  file_size    BIGINT NOT NULL,         -- bytes
-  total_chunks INTEGER NOT NULL,
-  file_hash    TEXT,                    -- SHA-256 hex, pre-computed by sender
-  created_at   TIMESTAMPTZ DEFAULT NOW()
-);
+### `users`
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `username` | String (unique) | Display name |
+| `email` | String (unique) | Login email |
+| `password_hash` | String | bcrypt hash |
+| `avatar_id` | String | Avatar animal name |
+| `last_seen` | DateTime | Last activity timestamp |
+| `created_at` | DateTime | Account creation time |
 
--- One per recipient — fully independent lifecycle
-CREATE TABLE transfers (
-  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  group_id             UUID NOT NULL REFERENCES transfer_groups(id),
-  sender_id            UUID NOT NULL REFERENCES users(id),
-  receiver_id          UUID NOT NULL REFERENCES users(id),
-  status               TEXT NOT NULL DEFAULT 'PENDING',
-  last_confirmed_chunk INTEGER NOT NULL DEFAULT -1,  -- checkpoint for resume
-  total_chunks         INTEGER NOT NULL,
-  created_at           TIMESTAMPTZ DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ DEFAULT NOW(),
-  completed_at         TIMESTAMPTZ
-);
-```
+### `transfers`
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `sender_id` | UUID | FK → users |
+| `receiver_id` | UUID | FK → users |
+| `file_name` | String | Original file name |
+| `file_size` | BigInt | File size in bytes |
+| `mime_type` | String | File MIME type |
+| `status` | Enum | `PENDING`, `TRANSFERRING`, `COMPLETED`, `CANCELLED`, `FAILED` |
+| `total_chunks` | Int | Total number of chunks |
+| `last_confirmed_chunk` | Int | Last ACKed chunk index (for resume) |
+| `created_at` | DateTime | Transfer creation time |
+| `completed_at` | DateTime | Completion timestamp |
 
-**Why `last_confirmed_chunk`?**
-
-When a 2 GB file transfer is interrupted at chunk 1500, the sender needs to know where to resume. We persist `last_confirmed_chunk` periodically (every 50 chunks by default — `DB_CHECKPOINT_INTERVAL`). On reconnection, the server reads this value and tells the sender: "resume from chunk 1501."
-
-Writing to PostgreSQL on every single ACK would mean 2048 DB writes for a 2 GB file. The checkpoint interval trades slight precision (±50 chunks on recovery) for drastically reduced DB write load.
+### `refresh_tokens`
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `user_id` | UUID | FK → users |
+| `token_hash` | String | Hashed refresh token |
+| `expires_at` | DateTime | Token expiry |
+| `revoked` | Boolean | Whether token has been revoked |
 
 ---
 
 ## Redis Usage
 
-Redis serves two purposes only — **no file data ever flows through Redis**.
-
-### 1. Presence (Key-Value with TTL)
-
-```
-Key:   presence:<userId>
-Value: "online"
-TTL:   30 seconds (refreshed by heartbeat)
-```
-
-```
-setUserOnline(userId, socketId)  → SET presence:<userId> "online" EX 30
-setUserOffline(userId)           → DEL presence:<userId>
-isUserOnline(userId)             → EXISTS presence:<userId>
-getBulkPresence(userIds)         → MGET presence:<id1> presence:<id2> ...
-```
-
-### 2. Pub/Sub (Cross-Instance Event Relay)
-
-Two channels:
-
-| Channel | Purpose |
-|---|---|
-| `presence` | Broadcast USER_ONLINE/USER_OFFLINE to all instances |
-| `transfer_events` | Route TRANSFER_REQUEST/ACCEPT/etc. to the correct instance |
-
-**Why this is needed:**
-
-```
-Ganesh → EC2-1    (Ganesh's socket lives here)
-Rahul  → EC2-2    (Rahul's socket lives here)
-
-Ganesh sends TRANSFER_REQUEST on EC2-1.
-EC2-1 checks: "Is Rahul's socket on THIS instance?" → No.
-EC2-1 publishes to Redis channel "transfer_events":
-  { targetUserId: rahul, eventName: 'TRANSFER_REQUEST', payload: {...} }
-
-EC2-2 is subscribed. It receives the message.
-EC2-2 finds Rahul's socket locally and emits to it.
-```
-
-File chunks themselves flow directly: **Sender Socket → Server → Receiver Socket** — all on the same TCP connection per path. If sender and receiver are on different EC2 instances, the chunk would need to cross instances. In V1, Nginx sticky sessions (ip_hash) keep sender and receiver on the same instance for chunk flow. Multi-instance chunk relay via Redis is a V2 concern (would require a dedicated streaming approach).
-
----
-
-## Connection Recovery
-
-```
-Timeline:
-  T=0:00  Transfer starts. Chunk 0 sent.
-  T=0:30  Chunk 800 confirmed (last_confirmed_chunk = 800 in PostgreSQL).
-  T=0:45  Ganesh's network drops. WebSocket disconnects.
-  T=0:45  Server: handleDisconnect(ganesh)
-            → checkpoint(T001, 800)
-            → UPDATE transfers SET status='INTERRUPTED'
-            → TransferState still in memory (not deleted yet)
-  T=1:00  Ganesh's browser reconnects (new WebSocket, new socketId).
-  T=1:00  JWT re-verified in Socket.IO auth middleware.
-  T=1:00  Ganesh's client emits TRANSFER_RESUME_REQUEST { transferId: T001 }
-  T=1:00  Server:
-            → SELECT * FROM transfers WHERE id = T001
-            → last_confirmed_chunk = 800
-            → Recreate TransferState (or update existing) with lastConfirmedChunk = 800
-            → UPDATE transfers SET status='TRANSFERRING'
-            → Response: { resumeFromChunk: 801, ... }
-  T=1:00  Ganesh's client resumes sending from chunk 801.
-```
-
-This works even if Ganesh reconnects to a **different EC2 instance** — the new instance has no in-memory state, but reads everything it needs from PostgreSQL.
-
----
-
-## Running Locally (Docker)
-
-### Prerequisites
-- Docker Desktop (with Docker Compose)
-
-### Steps
-
-```bash
-# 1. Clone / navigate to project root
-cd File_Sharing
-
-# 2. Copy environment template
-cp .env.example .env
-# Edit .env and fill in:
-#   JWT_SECRET=your-secret-here-at-least-32-chars
-#   (other values have sensible defaults for local dev)
-
-# 3. Start all services
-docker compose up --build
-
-# Services started:
-#   postgres  → localhost:5432
-#   redis     → localhost:6379
-#   server    → localhost:4000
-#   nginx     → localhost:80
-```
-
-The database migrations run automatically on first start via the `depends_on` + migration script in docker-compose.
-
-### 4. Open the client dev server
-
-```bash
-cd client
-npm install
-npm run dev
-# → http://localhost:5173
-```
-
-The client talks to the server via `VITE_API_URL=http://localhost:4000/api` and `VITE_SOCKET_URL=http://localhost:4000`.
-
-### To test with two users
-
-Open two browser tabs (or two browsers) at `http://localhost:5173`.
-- Register user "ganesh" in tab 1
-- Register user "rahul" in tab 2
-- In tab 1: search "rahul", select a file, click Send
-- In tab 2: Accept the incoming request
-- Watch the progress bar fill in real time
-
----
-
-## Running Without Docker
-
-### 1. Prerequisites
-
-- Node.js ≥ 18
-- PostgreSQL ≥ 14 (running locally or via a cloud service)
-- Redis ≥ 6 (running locally)
-
-### 2. Database Setup
-
-```bash
-psql -U postgres -c "CREATE DATABASE dropshare;"
-psql -U postgres -d dropshare -f database/migrations/001_initial.sql
-```
-
-### 3. Server
-
-```bash
-cd server
-npm install
-
-# Create .env from example
-cp ../.env.example .env
-# Edit .env with your DATABASE_URL, REDIS_URL, JWT_SECRET
-
-npm run dev   # uses nodemon for hot reload
-```
-
-### 4. Client
-
-```bash
-cd client
-npm install
-npm run dev
-```
-
----
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
+| Key Pattern | Type | TTL | Purpose |
 |---|---|---|---|
-| `DATABASE_URL` | ✅ | — | PostgreSQL connection string |
-| `REDIS_URL` | ✅ | — | Redis connection string |
-| `JWT_SECRET` | ✅ | — | JWT signing secret (min 32 chars) |
-| `PORT` | ❌ | `5000` | Server listen port |
-| `CLIENT_URL` | ❌ | `http://localhost:5173` | CORS allowed origin |
-| `JWT_EXPIRES_IN` | ❌ | `7d` | JWT token lifespan |
-| `CHUNK_SIZE_BYTES` | ❌ | `1048576` | Transfer chunk size (1 MB) |
-| `MAX_FILE_SIZE_BYTES` | ❌ | `5368709120` | Max file size (5 GB) |
-| `MAX_IN_FLIGHT_CHUNKS` | ❌ | `8` | App-level backpressure window |
-| `DB_CHECKPOINT_INTERVAL` | ❌ | `50` | Chunks between PostgreSQL checkpoints |
-| `NODE_ENV` | ❌ | `development` | `production` enables TLS for DB |
-
-Client (Vite, prefixed with `VITE_`):
-
-| Variable | Default | Description |
-|---|---|---|
-| `VITE_API_URL` | `http://localhost:4000/api` | REST API base URL |
-| `VITE_SOCKET_URL` | `http://localhost:4000` | Socket.IO server URL |
+| `presence:user:{userId}` | String | 35s | Online indicator (refreshed every 25s) |
+| `socket:user:{userId}` | String | 35s | Maps userId → socketId |
+| `socket:id:{socketId}` | String | 35s | Maps socketId → userId |
+| Pub/Sub channels | — | — | Cross-instance event broadcasting |
 
 ---
 
 ## API Reference
 
-All REST endpoints return `{ success: boolean, data: {...}, message?: string }`.
-
 ### Auth
 
-| Method | Path | Body | Description |
+| Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/api/auth/register` | `{ username, password, email?, displayName? }` | Create account |
-| `POST` | `/api/auth/login` | `{ username, password }` | Returns JWT token |
-| `POST` | `/api/auth/refresh` | `Authorization: Bearer <token>` | Refresh token |
+| `POST` | `/api/auth/register` | None | Create new account |
+| `POST` | `/api/auth/login` | None | Login, get JWT |
+| `POST` | `/api/auth/refresh` | None | Refresh access token |
+| `POST` | `/api/auth/logout` | Bearer | Revoke refresh token |
 
-### Users *(requires auth)*
+### Users
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/users/search?q=<query>` | Search users by username prefix |
-| `GET` | `/api/users/:id/status` | Get user online status + profile |
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/users/search?q={query}` | Bearer | Search users by username |
+| `GET` | `/api/users/me` | Bearer | Get own profile |
+| `PUT` | `/api/users/me` | Bearer | Update profile/avatar |
 
-### Transfers *(requires auth)*
+### Transfers
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/transfers` | Transfer history (sent + received) |
-| `GET` | `/api/transfers/:id` | Single transfer detail |
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/transfers` | Bearer | Get transfer history |
+| `GET` | `/api/transfers/:id` | Bearer | Get single transfer details |
+
+### Health
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | None | Server health check |
 
 ---
 
 ## Socket.IO Events
 
-All Socket.IO connections require a JWT in the auth handshake:
-
-```js
-io.connect(SERVER_URL, { auth: { token: 'eyJ...' } });
-```
-
-### Client → Server
+### Transfer Events (Client → Server)
 
 | Event | Payload | Description |
 |---|---|---|
-| `TRANSFER_REQUEST` | `{ fileName, fileSize, fileHash, totalChunks, receiverIds[] }` | Initiate transfer |
-| `TRANSFER_ACCEPT` | `{ transferId }` | Accept incoming transfer |
-| `TRANSFER_REJECT` | `{ transferId }` | Decline incoming transfer |
-| `TRANSFER_CANCEL` | `{ transferId }` | Cancel active transfer |
-| `CHUNK` | `{ transferId, chunkIndex, totalChunks, chunkData: ArrayBuffer }` | Send a chunk |
-| `CHUNK_ACK` | `{ transferId, chunkIndex }` | Confirm chunk received |
-| `PAUSE_TRANSFER` | `{ transferId }` | Pause active transfer |
-| `RESUME_TRANSFER` | `{ transferId }` | Resume paused transfer |
-| `TRANSFER_RESUME_REQUEST` | `{ transferId }` | Reconnect recovery |
-| `GET_PRESENCE` | `{ userIds[] }` | Bulk presence query |
+| `TRANSFER_REQUEST` | `{ receiverId, fileName, fileSize, mimeType, totalChunks }` | Initiate file transfer |
+| `TRANSFER_CANCEL` | `{ transferId }` | Cancel an active transfer |
+| `CHUNK_SEND` | `{ transferId, chunkIndex, data (ArrayBuffer) }` | Send a file chunk |
+| `CHUNK_ACK` | `{ transferId, chunkIndex }` | Acknowledge received chunk |
+| `RECOVERY_REQUEST` | `{ transferId }` | Resume after reconnect |
 
-### Server → Client
+### Transfer Events (Server → Client)
 
 | Event | Payload | Description |
 |---|---|---|
-| `USER_ONLINE` | `{ userId }` | User came online |
-| `USER_OFFLINE` | `{ userId }` | User went offline |
-| `TRANSFER_REQUEST` | Full transfer metadata | Incoming file request |
-| `TRANSFER_START` | `{ transferId, lastConfirmedChunk }` | Begin sending chunks |
-| `CHUNK` | `{ transferId, chunkIndex, totalChunks, chunkData }` | Relayed chunk to receiver |
-| `CHUNK_ACK` | `{ transferId, chunkIndex, progressPercent, speedBytesPerSecond, etaSeconds }` | ACK forwarded to sender |
-| `HASH_VERIFY` | `{ transferId, expectedHash }` | Request receiver to compute hash |
-| `HASH_RESULT` | `{ transferId, receiverHash, verified }` | Hash result forwarded to sender |
-| `TRANSFER_COMPLETE` | `{ transferId }` | All chunks delivered |
-| `PAUSE_ACK` | `{ transferId, lastConfirmedChunk }` | Pause confirmed |
-| `RESUME_ACK` | `{ transferId, resumeFromChunk }` | Resume point confirmed |
-| `TRANSFER_CANCEL_ACK` | `{ transferId, cancelledBy }` | Cancellation confirmed |
-| `TRANSFER_FAILED` | `{ transferId, message }` | Unrecoverable error |
-| `ERROR` | `{ message, transferId? }` | General error |
+| `TRANSFER_REQUEST` | `{ transfer }` | Incoming file transfer notification |
+| `TRANSFER_ACCEPTED` | `{ transferId }` | Receiver accepted your transfer |
+| `TRANSFER_REJECTED` | `{ transferId }` | Receiver rejected your transfer |
+| `TRANSFER_CANCELLED` | `{ transferId }` | Transfer was cancelled |
+| `CHUNK_RECEIVE` | `{ transferId, chunkIndex, data }` | Incoming chunk from sender |
+| `CHUNK_ACK` | `{ transferId, chunkIndex }` | ACK forwarded back to sender |
+| `TRANSFER_COMPLETE` | `{ transferId }` | Transfer completed |
+| `RECOVERY_RESPONSE` | `{ lastChunkIndex }` | Resume point after reconnect |
+
+### Room Events (Client → Server)
+
+| Event | Description |
+|---|---|
+| `ROOM_CREATE` | Create a new room |
+| `ROOM_JOIN` | Join an existing room |
+| `ROOM_INVITE` | Invite a user to your room |
+| `ROOM_LEAVE` | Leave a room |
+| `ROOM_DISMISS` | Close room (creator only) |
+| `ROOM_CHAT` | Send a chat message |
+| `ROOM_FILE_SHARED` | Announce a file transfer in room |
+
+### Room Events (Server → Client)
+
+| Event | Description |
+|---|---|
+| `ROOM_INVITED` | You've been invited to a room |
+| `ROOM_MEMBER_JOINED` | Someone joined your room |
+| `ROOM_MEMBER_LEFT` | Someone left your room |
+| `ROOM_DISMISSED` | Room was closed |
+| `ROOM_CHAT_MESSAGE` | New chat message in room |
+| `ROOM_FILE_SHARED` | File shared notification in room |
+
+### Presence Events
+
+| Event | Direction | Description |
+|---|---|---|
+| `USER_ONLINE` | Server → Client | A user came online |
+| `USER_OFFLINE` | Server → Client | A user went offline |
 
 ---
 
-## Scaling to Multiple Instances
+## Environment Variables
 
-DropShare is designed for horizontal scaling via AWS ECS/EC2 + ALB:
+### Server (`server/.env`)
+
+```env
+# Required
+DATABASE_URL="postgresql://user:password@host:5432/dbname?sslmode=require"
+REDIS_URL="redis://localhost:6379"
+JWT_SECRET="your-super-secret-jwt-key"
+
+# Optional (with defaults)
+NODE_ENV=development
+PORT=5000
+JWT_EXPIRES_IN=7d
+CLIENT_URL=http://localhost:5173
+
+# Transfer tuning
+CHUNK_SIZE_BYTES=1048576          # 1 MB chunks
+MAX_FILE_SIZE_BYTES=5368709120    # 5 GB max file size
+MAX_IN_FLIGHT_CHUNKS=8            # Flow control window
+DB_CHECKPOINT_INTERVAL=50         # Checkpoint every 50 chunks
+```
+
+### Client (`client/.env.local`)
+
+```env
+VITE_API_URL=http://localhost:5000
+VITE_SOCKET_URL=http://localhost:5000
+```
+
+---
+
+## Running Locally
+
+### Prerequisites
+
+- [Node.js 20+](https://nodejs.org)
+- [Docker Desktop](https://docker.com)
+- [Git](https://git-scm.com)
+
+### Option A: Docker Compose (Recommended)
+
+```bash
+# Clone the repo
+git clone https://github.com/blckspidey/RHEO_.git
+cd RHEO_
+
+# Start PostgreSQL + Redis + Server + Nginx
+docker-compose up -d
+
+# Frontend dev server (in a separate terminal)
+cd client
+npm install
+npm run dev
+```
+
+The app will be available at `http://localhost:5173`.
+
+### Option B: Manual Setup
+
+**1. Start PostgreSQL and Redis:**
+```bash
+docker run -d --name rheo_postgres -p 5432:5432 \
+  -e POSTGRES_DB=rheo_db -e POSTGRES_USER=rheo_user \
+  -e POSTGRES_PASSWORD=rheo_pass postgres:16-alpine
+
+docker run -d --name rheo_redis -p 6379:6379 redis:7-alpine
+```
+
+**2. Setup the server:**
+```bash
+cd server
+cp .env.example .env
+# Edit .env with your connection strings
+
+npm install
+npx prisma migrate dev
+npm run dev
+```
+
+**3. Setup the client:**
+```bash
+cd client
+npm install
+npm run dev
+```
+
+---
+
+## Production Deployment
+
+For full step-by-step production setup on AWS EC2 with SSL, see [DEPLOYMENT.md](./DEPLOYMENT.md).
+
+**Summary:**
+1. Launch an EC2 instance (Ubuntu 22.04, t3.small minimum)
+2. Install Docker and Docker Compose
+3. Clone the repo to `~/RHEO_`
+4. Create `.env` with your Neon DB `DATABASE_URL` and secrets
+5. Run `docker-compose -f docker-compose.prod.yml up -d`
+6. Configure Let's Encrypt SSL with Certbot
+
+**Services on EC2:**
+| Container | Purpose |
+|---|---|
+| `rheo_server` | Node.js API + Socket.IO |
+| `rheo_redis` | Redis for presence and pub/sub |
+| `rheo_nginx` | SSL + reverse proxy |
+
+Frontend is deployed separately on **Vercel** (auto-detected Vite project).
+
+---
+
+## CI/CD Pipeline
+
+Every `git push origin main` triggers the GitHub Actions pipeline at [`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml):
 
 ```
-ALB (Application Load Balancer)
- ├── Sticky Sessions: ip_hash (Nginx) or cookie (ALB)
- │   → Ensures Sender and Receiver land on the same instance
- │     for chunk relay (no cross-instance file data)
- │
- ├── EC2-1 (Node.js + Socket.IO)
- ├── EC2-2 (Node.js + Socket.IO)
- └── EC2-3 (Node.js + Socket.IO)
-       │
-       └── All connect to same RDS PostgreSQL + ElastiCache Redis
+push to main
+    │
+    ├─► Job 1: Verify & Build Check
+    │       Install deps → Generate Prisma client → Build React app
+    │
+    ├─► Job 2: Deploy Backend to EC2 (SSH)
+    │       SSH into EC2 → git pull → Write .env from secrets
+    │       → docker-compose up -d --build → prune old images
+    │
+    └─► Job 3: Deploy Frontend to Vercel
+            npx vercel --prod (using VERCEL_TOKEN)
 ```
 
-**What Redis Pub/Sub handles across instances:**
-- Presence broadcasts (USER_ONLINE/OFFLINE)
-- Transfer control events (TRANSFER_REQUEST, TRANSFER_ACCEPT, etc.)
+### Required GitHub Secrets
 
-**What stays within an instance:**
-- Chunk relay (CHUNK events — sender and receiver are on the same instance due to sticky sessions)
-- In-memory TransferManager state
-
-**What PostgreSQL handles across failures:**
-- Transfer history and status
-- `last_confirmed_chunk` for precise resume after any instance failure
-
----
-
-## Design Philosophy
-
-> **V1 is about clarity over cleverness.**
-
-1. **No magic.** Every piece of state lives in one of three places: PostgreSQL (durable), Redis (ephemeral coordination), or in-memory TransferManager (hot path). No confusion about which is authoritative.
-
-2. **TCP does its job.** We don't re-implement reliability. TCP handles byte ordering, retransmission, and flow control. Our application layer adds transfer identity, progress tracking, and recovery.
-
-3. **The server is a relay, not a buffer.** File data flows through the server one chunk at a time. Memory usage is bounded regardless of file size.
-
-4. **Resumable by design.** The checkpoint pattern (not every ACK, but every N ACKs) is a deliberate tradeoff: lower DB write load at the cost of ±N chunk precision on recovery.
-
-5. **Each component has one job.** Socket handlers call services. Services call the DB. Nothing skips a layer.
+| Secret | Description |
+|---|---|
+| `EC2_HOST` | EC2 public IP or domain |
+| `EC2_USERNAME` | SSH username (usually `ubuntu`) |
+| `EC2_SSH_KEY` | Private SSH key for EC2 access |
+| `DATABASE_URL` | Neon DB PostgreSQL connection string |
+| `JWT_SECRET` | JWT signing secret |
+| `VERCEL_TOKEN` | Vercel personal access token |
+| `VERCEL_ORG_ID` | Vercel organization ID |
+| `VERCEL_PROJECT_ID` | Vercel project ID |
 
 ---
 
-*Built with Node.js, Socket.IO, PostgreSQL, Redis, React (Vite), and Tailwind CSS v4.*
+## License
+
+MIT — Built with ❤️ by [Ganesh Daware](https://github.com/blckspidey)

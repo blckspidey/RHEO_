@@ -141,7 +141,16 @@ export function RoomProvider({ children }) {
 
     const onRoomChatMessage = ({ roomId, message }) => {
       if (activeRoomRef.current?.roomId !== roomId) return;
-      addChatMessage(message);
+      setChatMessages(prev => {
+        if (prev.some(m => m.id === message.id)) return prev;
+        const optIdx = prev.findIndex(m => m.tempOpt && m.text === message.text);
+        if (optIdx !== -1) {
+          const next = [...prev];
+          next[optIdx] = message;
+          return next;
+        }
+        return [...prev, message];
+      });
     };
 
     const onRoomFileShared = ({ roomId, notice }) => {
@@ -304,7 +313,21 @@ export function RoomProvider({ children }) {
     const socket = getSocket();
     const room = activeRoomRef.current;
     if (!socket || !room || !text?.trim()) return;
-    socket.emit('ROOM_CHAT', { roomId: room.roomId, text });
+
+    const trimmed = text.trim();
+    const optMsg = {
+      id: `opt_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      tempOpt: true,
+      senderId: socket.id,
+      senderUsername: 'You',
+      text: trimmed,
+      timestamp: new Date().toISOString(),
+      type: 'message',
+    };
+
+    // Instant 0ms optimistic rendering
+    setChatMessages(prev => [...prev, optMsg]);
+    socket.emit('ROOM_CHAT', { roomId: room.roomId, text: trimmed });
   }, []);
 
   const notifyFileShared = useCallback((fileName, fileSize, transferId) => {

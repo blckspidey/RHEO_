@@ -90,6 +90,9 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Remove local Vercel link cache
+        run: rm -rf .vercel client/.vercel
+
       - name: Deploy to Vercel Production
         uses: amondnet/vercel-action@v25
         with:
