@@ -78,26 +78,3 @@ jobs:
             docker-compose -f docker-compose.prod.yml down --remove-orphans || true
             docker-compose -f docker-compose.prod.yml up -d --build
             docker image prune -f
-
-  # ── Job 3: Deploy Frontend to Vercel ───────────────────────────
-  deploy-frontend:
-    name: Deploy Frontend to Vercel
-    needs: verify
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/v1' || github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Remove local Vercel link cache
-        run: rm -rf .vercel client/.vercel
-
-      - name: Deploy to Vercel Production
-        uses: amondnet/vercel-action@v42
-        with:
-          vercel-token: ${{ secrets.VERCEL_TOKEN }}
-          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
-          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
-          vercel-args: '--prod'
-          working-directory: ./client
